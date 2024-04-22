@@ -11,6 +11,9 @@ uvicorn = "^0.29.0"
 black = "^24.4.0"
 flake8 = "^7.0.0"
 isort = "^5.13.2"
+prettier = "^0.0.7"
+vite = "^1.5.2"
+react = "^4.3.0"
 
 [tool.poetry.dev-dependencies]
 
