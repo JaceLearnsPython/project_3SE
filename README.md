@@ -293,3 +293,387 @@ page for either server or client changes.
 This is probably a good commit/PR point, so go ahead and do that.
 
 ## Set up the Database
+
+Now we'd like to have an instance of postgres running. Note that this
+will be a separate container from our ui and server
+containers. Typically, we could just run a postgres container directly
+like this.
+
+```
+$ docker run -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:15
+```
+
+This sets up the password for the databse to be `postgres` and
+forwards the container postgres port (5432) to the same port on the
+host (you may need to modify this if the port has a conflict).
+
+This works fine, but wouldn't it be great to just run this as part of
+the `docker compose up` command, along with our UI and server? Well,
+you can!
+
+To bootstrap things, let's go ahead and set up a container with our
+dvdrental database set up. Create a new directory in your project
+called `db` and copy the `Dockerfile` and `init.sh` script from
+[activity 4](../../activities/activity4) to the new directory.
+
+
+Now let's add the following entry to our `docker compose`
+services:
+
+```
+  db:
+    build:
+      context: db
+    environment:
+      - POSTGRES_PASSWORD=postgres
+    healthcheck:
+      test: "psql -U postgres -h localhost -p 5432"
+      timeout: 60s
+      interval: 10s
+```
+
+This tells docker compose to use the `Dockerfile` in the `db`
+directory to build our container image, and to test to make sure we
+can make connections to the `db` before we consider it "healthy."
+
+One thing left to do: make it so your `server` container doesn't start
+until the `db` container is healthy. To do this, we do the same thing
+we did for the `ui` containers. Go ahead and do that.
+
+Once we're good, let's run `docker compose down` and `docker compose
+up` again. We can see that our database server is there by running
+`docker exec` as in [Activity 3](../../activities/activity3).
+
+```
+$ docker exec -it project3-db-1 bash
+```
+
+Let's confirm the dvdrental database is there as we did before. Now
+let's try to connect to it from our application.
+
+This is a good place to commit and set up a PR.
+
+## Accessing a Model in a Controller
+
+Before we do anything, we'll need to add some Python libraries (via
+Poetry, of course) to the docker image for our server. We'll need to
+add both sqlalchemy with the asyncio extras, and we'll also need to
+add asyncpg. I don't think we've added a poetry dependency with extras
+before, so here's how you can do that:
+
+```
+$ poetry add "sqlalchemy[asyncio]"
+```
+
+Installing the `asyncpg` dependency should be second nature by now. :)
+
+Remember that since you're installing poetry dependencies as part of
+the build process, you'll need to tell docker compose to rebuild the
+image next time you launch it to get the new dependencies.
+
+```
+$ docker compose up --build
+```
+
+Once our dependencies are squared away, we'll copy some code from
+[orm.py in Activity 4](../../activities/activity4) into a file called
+`models.py` file.
+
+```python
+from sqlalchemy.ext.automap import automap_base
+from sqlalchemy.schema import MetaData
+
+
+class AutoModels:
+    def __init__(self, engine):
+        self._base = None
+        self._engine = engine
+
+    async def get(self, table_name: str):
+        if not self._base:
+            await AutoModels._async_init()
+        return getattr(self._base.classes, table_name, None)
+
+    async def _async_init(self):
+        async with self._engine.connect() as conn:
+            metadata = MetaData()
+            await conn.run_sync(metadata.reflect)
+            self._base = automap_base(metadata=metadata)
+            self._base.prepare()
+
+    @staticmethod
+    async def create(engine):
+        instance = AutoModels(engine)
+        await instance._async_init()
+        return instance
+```
+
+This is simply our `AutoModels` class from `orm.py`. Now we need to
+initialize it in our FastAPI app. Since initializing these models
+requires a call to the database, it's relatively expensive, so we
+should do it before the application starts.
+
+FastAPI has a notion of "lifespan" events that allow you to run things
+before the server starts and before it shuts down. Here's a modified
+FastAPI server that does what we want and sets up a new route that
+returns data from the `film` table.
+
+```python
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.future import select
+
+from models import AutoModels
+
+engine = create_async_engine(
+    "postgresql+asyncpg://postgres:postgres@db:5432/dvdrental", echo=True
+)
+
+
+auto_models = None
+
+
+async def lifespan(app):
+    print("startup")
+    global auto_models
+    auto_models = await AutoModels.create(engine)
+    yield
+    print("shutdown")
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/api/v1/hello")
+async def root():
+    return {"message": "Hello World"}
+
+
+@app.get("/api/v1/films")
+async def films():
+    Film = await auto_models.get("film")
+
+    results = []
+
+    async with AsyncSession(engine) as session:
+        films = await session.execute(select(Film))
+        for film in films.scalars().all():
+            results.append(
+                {
+                    "title": film.title,
+                    "description": film.description,
+                    "id": film.film_id,
+                }
+    return results
+
+
+app.mount("/", StaticFiles(directory="ui/dist", html=True), name="ui")
+```
+
+Test this out and make sure the route is returning data from the
+database as you'd expect. If it is, let's go ahead and commit it.
+
+## Creating an Index
+
+Now that all the pieces of your app are working, let's create a React
+view that returns data from the server-side `films` API. In our
+main.jsx file, we can create a simple React component to display the
+data. It might look something like this.
+
+```javascript
+function FilmEntry({ id, title, description }) {
+  return (
+    <p>
+      <a href={`/film/${id}`}>{title}</a>: {description}
+    </p>
+  );
+}
+```
+
+Notice that this React component produces a link that will not work
+yet. The goal is that this will eventually take us to the "Film"
+view. We will get to that in a moment.
+
+Now, in our main file, we'll fetch the data from the API and create a
+list of those components from the list of retrieved data using the Map
+function that Sarah explained in class. Our main function might look
+something like this.
+
+```javascript
+async function main() {
+  const filmsResponse = await fetch("/api/v1/films");
+  const films = await filmsResponse.json();
+
+  const rootElt = document.getElementById("app");
+  const root = createRoot(rootElt);
+  root.render(
+    films.map((film) => (
+      <ul>
+        <li>
+          <FilmEntry
+            id={film.id}
+            title={film.title}
+            description={film.description}
+          />
+        </li>
+      </ul>
+    )),
+  );
+}
+```
+
+Let's make sure that your index is showing up (and, yes, the links
+will not work). Once it is, let's commit, make a PR, and move on to
+the next section.
+
+## Creating a Film View
+
+### Scaffolding The UI
+
+Let's make those links work! First, we're going to create a new "film"
+view which you can think of as a new HTML file. The easiest way to do
+this is to copy the existing `index.html` file to a file called
+`film.html` and the existing `main.jsx` file to a file called
+`film.jsx`.
+
+Then we'll edit it so that the `film.html` file is loading the
+`film.jsx` script. You can also modify the `film.jsx` component so
+that it just shows something like "This is the Film View" instead of
+having it behave the same as `main.jsx`. That will help us make sure
+things are working correctly.
+
+Next, we need to tell vite about the new view so it builds it. Until
+now, we haven't needed a vite config file since it uses `index.html`
+as the entry point by default. Creating a config that specifies both
+isn't too hard. Just create a file called `vite.config.js` in your
+`ui` directory, and populate it like this.
+
+```javascript
+const { defineConfig } = require("vite");
+
+module.exports = defineConfig({
+  build: {
+    rollupOptions: {
+      input: {
+        main: "./index.html",
+        film: "./film.html",
+      },
+    },
+  },
+});
+```
+
+You may need to restart your ui container to get this to take effect.
+
+```
+$ docker compose restart ui
+```
+
+Once that happens, you should see `film.html` inside the `dist`
+directory in `ui`.
+
+### Creating the Controller
+
+In `server.py` we'll create a new route (controller) to deliver the
+view. First, we'll need to import Fast API's `HTMLResponse` library.
+
+```python
+from fastapi.responses import HTMLResponse
+```
+
+Then we'll create the route.
+
+```python
+@app.get("/film/{id}", response_class=HTMLResponse)
+async def film(id: int):
+    with open("ui/dist/film.html") as file:
+        return file.read()
+```
+
+Notice how we've "templatized" the route, and the id is piped through
+to the function. This will become important in the next section.
+
+### Creating the API
+
+Now we'll want to create the film API route that you'll call from
+JavaScript to get your data to populate the view. The function header
+is going to look similar to the route above, and the body will look
+similar to the `films` route we created earlier that returns all the
+film.
+
+The difference is that we want to query the model and get back just
+the data associated with the provided id. Write the database query,
+and return /all/ the information associated with the film, although we
+can leave out the data for joined tables for the time being.
+
+### Updating the View
+
+Now let's build out the UI where we show all the information
+associated with the film. To do this, you'll need to make an API call
+to the route you just created. To do this, you'll need to extract the
+ID from the route.
+
+The path is stored in `window.location.pathname`. But it will be
+something like `film/388` and you just need the `388` part. Chat GPT
+can probably suggest various approaches that can help you extract
+that.
+
+Once you have the ID, you'll need to fetch the data. Then you can
+construct the view as a React component.
+
+Once you get the view displaying all of the film data, add a link to
+take you back to the root list view so it's easy to jump around. This
+is a good place to commit and make a PR (with a screenshot of your
+UI!), so go ahead and do that.
+
+## Creating Your Own Data Models
+
+This is the part where I was going to have you create your own data
+model. I spent quite a bit of time trying to figure out how to do that
+in a minimal, understandable way that would also scale up to a larger
+application. Ultimately, I decided that we just won't have time this
+semester. :(
+
+That said, [SQLAlchemy's ORM Quick
+Start](https://docs.sqlalchemy.org/en/20/orm/quickstart.html) shows
+you how to create your own models, so you are welcome to experiment
+with that if you'd like. And getting some of your own data models
+working will certainly "Exceed Expectations" for this project.
+
+Unfortunately, that's not quite enough to build an application that's
+both flexible and maintainable. To do that, you'll also need a tool to
+manage database migrations (which basically means changes to your
+database schemas). [Alembic](https://alembic.sqlalchemy.org/), which
+was created by the same folks who created SQLAlchemy, is a great tool
+for doing that. But, of course, it has its own learning curve.
+
+One new tool that is on the horizon is
+[SQLModel](https://sqlmodel.tiangolo.com/), written by the same person
+who wrote Fast API. I played around with it a bit this weekend, and
+it's excellent although a little rough around the edges.
+
+The value with SQLModel is that it abstracts both SQLAlchemy and
+Pydantic. This roughly means that you can create a single model that
+can be used both to represent your database table and use the same one
+as a Python type which can be used as a FastAPI type.
+
+Going forward, I think a good stack would be to use SQLModel to build
+your database models and Python types, and then Alembic to handle your
+migrations. If you're going to use the Python/JavaScript stack for
+your capstone project, this might be a good approach.
+
+## CRUD Operations
+
+Since we're not building our own data models, we'll use the generated
+models for the dvdrental database. We've seen how we can create an API
+endpoint for the view that reads content from the database. But how do
+we change it?
+
+Most data models support the basic CRUD (Create, Read, Update, Delete)
+operations. Those map fairly nicely to HTTP verbs (Post, Get, Update,
+Delete), and that mapping is a crucial component of a REST application
+architecture. So how do we do we implement some of these other CRUD
+operations via HTTP verbs?
+
+(More coming soon.)
