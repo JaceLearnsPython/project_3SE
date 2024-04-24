@@ -6,3 +6,30 @@ services:
       - "8000:8000"
     volumes:
       - .:/app
+    depends_on:
+      ui:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+
+  ui:
+    image: node:lts
+    volumes:
+      - ./ui:/ui
+      - /ui/node_modules
+    working_dir: /ui
+    healthcheck:
+      test: "ls dist"
+      timeout: 60s
+      interval: 10s
+    entrypoint: bash -c "npm ci && npm run dev"
+
+  db:
+    build:
+      context: db
+    environment:
+      - POSTGRES_PASSWORD=postgres
+    healthcheck:
+      test: "psql -U postgres -h localhost -p 5432"
+      timeout: 60s
+      interval: 10s
