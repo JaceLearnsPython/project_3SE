@@ -8,7 +8,7 @@ async function main() {
   const rootElt = document.getElementById("app");
   const root = createRoot(rootElt);
   root.render(
-    films.map((film) => (
+      films.map((film) => (
       <ul>
         <li>
           <FilmEntry
